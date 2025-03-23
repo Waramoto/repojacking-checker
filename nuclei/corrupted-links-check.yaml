@@ -1,0 +1,16 @@
+id: corrupted-links-check
+
+info:
+  name: Corrupted links check
+  author: Waramoto
+  severity: medium
+
+requests:
+  - method: GET
+    path:
+      - "{{BaseURL}}"
+    matchers:
+      - type: status
+        status:
+          - 404
+          - 301
