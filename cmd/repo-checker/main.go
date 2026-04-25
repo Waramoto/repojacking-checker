@@ -15,6 +15,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/google/go-github/v85/github"
 )
 
 func main() {
@@ -28,6 +30,12 @@ func main() {
 		fmt.Println("\nReceived shutdown signal. Cleaning up...")
 		cancel()
 	}()
+
+	ghToken := os.Getenv("GH_TOKEN")
+	if ghToken == "" {
+		fmt.Println("GH_TOKEN environment variable is not set")
+		return
+	}
 
 	if len(os.Args) <= 2 {
 		fmt.Println("Please provide CSV file and number of workers")
@@ -82,13 +90,6 @@ func main() {
 	writer := csv.NewWriter(outputFile)
 	defer writer.Flush()
 
-	httpClient := &http.Client{
-		Timeout: 5 * time.Second,
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			return http.ErrUseLastResponse
-		},
-	}
-
 	results := make(chan []string, workersNum)
 
 	var writerWG sync.WaitGroup
@@ -118,6 +119,11 @@ func main() {
 	sem := make(chan struct{}, workersNum)
 	var workerWG sync.WaitGroup
 
+	httpClient := &http.Client{
+		Timeout: 5 * time.Second,
+	}
+	githubClient := github.NewClient(httpClient).WithAuthToken(ghToken)
+
 loop:
 	for i := processedLines; i < len(records); i++ {
 		select {
@@ -143,7 +149,7 @@ loop:
 			sleepTime := 5 * time.Second
 			const maxSleepTime = 5 * time.Minute
 
-			err = checkRepo(ctx, httpClient, owner, repo, results)
+			err = checkRepo(ctx, githubClient, owner, repo, results)
 			for err != nil {
 				if !(strings.Contains(err.Error(), "timeout") || errors.Is(err, context.DeadlineExceeded)) {
 					if !errors.Is(err, context.Canceled) {
@@ -158,7 +164,7 @@ loop:
 				}
 				time.Sleep(sleepTime)
 
-				err = checkRepo(ctx, httpClient, owner, repo, results)
+				err = checkRepo(ctx, githubClient, owner, repo, results)
 			}
 		}(owner, repo)
 
@@ -180,22 +186,14 @@ loop:
 	fmt.Printf("\nFounded %d corrupted links from %d repositories\n", corruptedLinksNum, processedLines)
 }
 
-func checkRepo(ctx context.Context, client *http.Client, owner, repo string, results chan<- []string) error {
-	url := getRepoLink(owner, repo)
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodHead, url, http.NoBody)
+func checkRepo(ctx context.Context, client *github.Client, owner, repo string, results chan<- []string) error {
+	_, resp, err := client.Repositories.Get(ctx, owner, repo)
 	if err != nil {
-		return fmt.Errorf("error creating request: %w", err)
-	}
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return fmt.Errorf("error sending request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusMovedPermanently {
-		results <- []string{owner, repo, fmt.Sprintf("%d", resp.StatusCode)}
+		if resp != nil && (resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusMovedPermanently) {
+			results <- []string{owner, repo, fmt.Sprintf("%d", resp.StatusCode)}
+			return nil
+		}
+		return fmt.Errorf("error checking repository: %w", err)
 	}
 
 	return nil
