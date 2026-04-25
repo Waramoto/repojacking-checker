@@ -17,9 +17,45 @@ import (
 	"time"
 
 	"github.com/google/go-github/v85/github"
+	"github.com/joho/godotenv"
 )
 
+type config struct {
+	GHToken string `env:"GH_TOKEN"`
+}
+
 func main() {
+	if err := run(); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+func run() error {
+	err := godotenv.Load()
+	if err != nil {
+		return fmt.Errorf("failed to load .env file: %w", err)
+	}
+
+	ghToken := os.Getenv("GH_TOKEN")
+	if ghToken == "" {
+		return fmt.Errorf("GH_TOKEN environment variable is not set")
+	}
+
+	if len(os.Args) <= 2 {
+		return fmt.Errorf("please provide CSV file and number of workers")
+	}
+
+	inputFile := os.Args[1]
+	if filepath.Ext(inputFile) != ".csv" {
+		return fmt.Errorf("provided file is not CSV")
+	}
+
+	workersNum, err := strconv.Atoi(os.Args[2])
+	if err != nil {
+		return fmt.Errorf("provided number of workers is incorrect: %w", err)
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -27,64 +63,38 @@ func main() {
 	signal.Notify(signalChan, os.Interrupt, syscall.SIGTERM)
 	go func() {
 		<-signalChan
-		fmt.Println("\nReceived shutdown signal. Cleaning up...")
+		fmt.Fprintln(os.Stderr, "\nReceived shutdown signal. Cleaning up...")
 		cancel()
 	}()
 
-	ghToken := os.Getenv("GH_TOKEN")
-	if ghToken == "" {
-		fmt.Println("GH_TOKEN environment variable is not set")
-		return
-	}
-
-	if len(os.Args) <= 2 {
-		fmt.Println("Please provide CSV file and number of workers")
-		return
-	}
-
-	inputFile := os.Args[1]
-	if filepath.Ext(inputFile) != ".csv" {
-		fmt.Println("Provided file is not CSV")
-		return
-	}
-
-	workersNum, err := strconv.Atoi(os.Args[2])
-	if err != nil {
-		fmt.Println("Provided number of workers is incorrect")
-		return
-	}
-
 	file, err := os.Open(inputFile)
 	if err != nil {
-		fmt.Printf("Error opening file: %v\n", err)
-		return
+		return fmt.Errorf("error opening file: %w", err)
 	}
 	defer file.Close()
 
 	reader := csv.NewReader(file)
 	records, err := reader.ReadAll()
 	if err != nil {
-		fmt.Printf("Error reading CSV file: %v\n", err)
-		return
+		return fmt.Errorf("error reading CSV file: %w", err)
 	}
 
 	outputFileName := "corrupted_repos.csv"
 	outputFile, err := os.OpenFile(outputFileName, os.O_APPEND|os.O_CREATE|os.O_RDWR, 0644)
 	if err != nil {
-		fmt.Printf("Error creating/opening output file: %v\n", err)
-		return
+		return fmt.Errorf("error creating/opening output file: %w", err)
 	}
 	defer outputFile.Close()
 
 	corruptedLinksNum, err := getCorruptedLinksNum(outputFile)
 	if err != nil {
-		fmt.Printf("WARN: failed to get corrupted links number: %v\n", err)
+		fmt.Fprintf(os.Stderr, "WARN: failed to get corrupted links number: %v\n", err)
 	}
 
 	progressFileName := "repo_checker_progress.txt"
 	processedLines, err := getProcessedLines(progressFileName)
 	if err != nil {
-		fmt.Printf("WARN: failed to get processed lines: %v\n", err)
+		fmt.Fprintf(os.Stderr, "WARN: failed to get processed lines: %v\n", err)
 	}
 
 	writer := csv.NewWriter(outputFile)
@@ -104,7 +114,7 @@ func main() {
 				}
 
 				if err := writer.Write(result); err != nil {
-					fmt.Printf("Error writing to CSV: %v\n", err)
+					fmt.Fprintf(os.Stderr, "Error writing to CSV: %v\n", err)
 				}
 
 				corruptedLinksNum++
@@ -135,7 +145,7 @@ loop:
 		record := records[i]
 
 		if len(record) < 2 {
-			fmt.Printf("WARN: skipping invalid record on line %d: %v\n", i+1, record)
+			fmt.Fprintf(os.Stderr, "WARN: skipping invalid record on line %d: %v\n", i+1, record)
 			continue
 		}
 
@@ -149,11 +159,11 @@ loop:
 			sleepTime := 5 * time.Second
 			const maxSleepTime = 5 * time.Minute
 
-			err = checkRepo(ctx, githubClient, owner, repo, results)
+			err := checkRepo(ctx, githubClient, owner, repo, results)
 			for err != nil {
 				if !(strings.Contains(err.Error(), "timeout") || errors.Is(err, context.DeadlineExceeded)) {
 					if !errors.Is(err, context.Canceled) {
-						fmt.Printf("\nError checking repository %s: %v\n", getRepoLink(owner, repo), err)
+						fmt.Fprintf(os.Stderr, "\nError checking repository %s: %v\n", getRepoLink(owner, repo), err)
 					}
 					return
 				}
@@ -168,8 +178,8 @@ loop:
 			}
 		}(owner, repo)
 
-		if err = saveProgress(progressFileName, i+1); err != nil {
-			fmt.Printf("WARN: failed to save progress on line %d: %v\n", i+1, record)
+		if err := saveProgress(progressFileName, i+1); err != nil {
+			fmt.Fprintf(os.Stderr, "WARN: failed to save progress on line %d: %v\n", i+1, record)
 		}
 
 		fmt.Printf("\rProcessed records: %d/%d", i+1, len(records))
@@ -184,6 +194,7 @@ loop:
 	writerWG.Wait()
 
 	fmt.Printf("\nFounded %d corrupted links from %d repositories\n", corruptedLinksNum, processedLines)
+	return nil
 }
 
 func checkRepo(ctx context.Context, client *github.Client, owner, repo string, results chan<- []string) error {
@@ -209,7 +220,7 @@ func getProcessedLines(progressFile string) (int, error) {
 		if os.IsNotExist(err) {
 			return 0, fmt.Errorf("file %s does not exist", progressFile)
 		}
-		return 0, fmt.Errorf("error opening progress file: %v\n", err)
+		return 0, fmt.Errorf("error opening progress file: %v", err)
 	}
 	defer file.Close()
 
@@ -218,7 +229,7 @@ func getProcessedLines(progressFile string) (int, error) {
 		var lineNumber int
 		_, err = fmt.Sscanf(scanner.Text(), "%d", &lineNumber)
 		if err != nil {
-			return 0, fmt.Errorf("error scanning line %d: %v\n", lineNumber, err)
+			return 0, fmt.Errorf("error scanning line %d: %v", lineNumber, err)
 		}
 		return lineNumber, nil
 	}
@@ -245,7 +256,7 @@ func getCorruptedLinksNum(outputFile *os.File) (int, error) {
 	reader := csv.NewReader(outputFile)
 	records, err := reader.ReadAll()
 	if err != nil {
-		return 0, fmt.Errorf("error reading CSV file: %v\n", err)
+		return 0, fmt.Errorf("error reading CSV file: %v", err)
 	}
 	return len(records), nil
 }
