@@ -1,0 +1,4 @@
+.env
+*.csv
+bq-results.json
+*_progress.txt
