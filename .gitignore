@@ -1,4 +1,4 @@
 .env
 *.csv
-bq-results.json
+bq-results*.json
 *_progress.txt
